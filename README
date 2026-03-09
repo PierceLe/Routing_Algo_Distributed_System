@@ -1,0 +1,86 @@
+# COMP3221 Assignment 1 – Routing Protocol
+
+## Coding Environment
+
+- Python 3.8+
+- macOS / Linux (any POSIX-compatible system)
+- Standard library only – no external packages required
+  (uses: socket, threading, json, heapq, sys, time, os, abc)
+
+## How to Run
+
+    chmod +x Routing.sh
+    ./Routing.sh <Node-ID> <Port-NO> <Node-Config-File> <RoutingDelay> <UpdateInterval>
+
+Example:
+
+    ./Routing.sh F 6005 Fconfig.txt 60 10
+
+## Arguments
+
+| Argument         | Description                                               |
+|------------------|-----------------------------------------------------------|
+| Node-ID          | Single uppercase letter (A–Z)                             |
+| Port-NO          | Integer port the node listens on (starting from 6000)     |
+| Node-Config-File | File listing immediate neighbours (see spec §3.2)         |
+| RoutingDelay     | Seconds to wait before the first routing-table output     |
+| UpdateInterval   | Seconds between periodic UPDATE broadcasts                |
+
+## Project Structure
+
+    Routing.sh                  Entry-point wrapper script
+    README                      This file
+    routing/
+      __init__.py               Top-level package marker
+      __main__.py               Allows `python3 -m routing`
+      main.py                   CLI argument parsing and validation
+      core/                     Core data structures & orchestration
+        graph.py                  Undirected weighted graph (adjacency list)
+        router.py                 Dijkstra shortest-path computation
+        node.py                   Node class (orchestrator, threading)
+      commands/                 Command pattern implementation
+        base.py                   Abstract Command base class
+        dynamic.py                CHANGE, FAIL, RECOVER, QUERY, RESET, …
+        bonus.py                  MERGE, SPLIT, CYCLE DETECT
+        factory.py                CommandFactory input parser
+      network/                  Network communication layer
+        socket_manager.py         UDP socket wrapper
+        protocol.py               STDIN/STDOUT and socket message formats
+      config/                   Configuration handling
+        parser.py                 Config-file parser and validator
+      utils/                    Shared helpers
+        validation.py             Node-ID validation
+        formatting.py             Cost formatting and error_exit
+
+## Supported Commands
+
+All commands from the spec are implemented:
+
+| Command        | Description                                      |
+|----------------|--------------------------------------------------|
+| CHANGE         | Update the cost of an edge to a neighbour        |
+| FAIL           | Mark a node as down (stop broadcasts if self)    |
+| RECOVER        | Bring a node back up                             |
+| QUERY          | Print least-cost path from this node             |
+| QUERY PATH     | Print least-cost path between any two nodes      |
+| RESET          | Restore original config and re-broadcast         |
+| BATCH UPDATE   | Process a file of commands sequentially           |
+| MERGE (bonus)  | Absorb one node into another                     |
+| SPLIT (bonus)  | Partition the graph alphabetically                |
+| CYCLE DETECT (bonus) | Report whether the graph contains a cycle   |
+
+## Design Overview
+
+The solution uses a link-state approach: each node shares its full known
+topology with direct neighbours over UDP, so every node can eventually
+learn the entire graph and run Dijkstra locally.
+
+Four threads run concurrently:
+
+1. Main / STDIN thread – reads commands and UPDATE packets.
+2. Socket listener (daemon) – receives topology data from neighbours.
+3. Sender (daemon) – broadcasts UPDATE packets every UpdateInterval seconds.
+4. Routing calculator (daemon) – re-runs Dijkstra when topology changes.
+
+Thread safety is ensured with an RLock on shared state and a separate lock
+on print output to prevent interleaving.
