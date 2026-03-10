@@ -158,6 +158,7 @@ class Node:
 
     def _routing_loop(self):
         time.sleep(self.routing_delay)
+        time.sleep(0.1)
         with self.lock:
             first_output = self.last_routing_table is None
         self.compute_and_output_routing_table(force=first_output)
@@ -165,7 +166,7 @@ class Node:
             self.routing_event.wait(timeout=1.0)
             if self.routing_event.is_set():
                 self.routing_event.clear()
-                time.sleep(0.1)
+                time.sleep(0.05)
                 self.routing_event.clear()
                 self.compute_and_output_routing_table(force=False)
 
@@ -224,7 +225,7 @@ class Node:
                     self.graph.add_edge(source, nid, cost)
                     changed = True
         if changed:
-            self.compute_and_output_routing_table(force=False)
+            self.routing_event.set()
 
     def _accept_node(self, nid):
         """Check if a node should be accepted based on split/merge state."""
@@ -236,13 +237,16 @@ class Node:
         return True
 
     def _process_socket_data(self, data):
-        """Handle raw bytes received on the UDP socket."""
+        """Handle raw bytes received on the UDP socket.
+
+        Updates the graph silently for internal convergence.
+        Output is only triggered by STDIN events and commands.
+        """
         try:
             msg = Protocol.deserialize_socket_message(data)
         except Exception:
             return
 
-        changed = False
         with self.lock:
             topology = msg.get("topology", {})
             remote_failed = set(msg.get("failed", []))
@@ -268,15 +272,10 @@ class Node:
                     old = self.graph.get_cost(nid, n)
                     if old is None or old != ncost:
                         self.graph.add_edge(nid, n, ncost)
-                        changed = True
 
             for nid in remote_failed:
                 if nid not in self.failed_nodes:
                     self.failed_nodes.add(nid)
-                    changed = True
-
-        if changed:
-            self.routing_event.set()
 
     def _output_routing_table(self, routes):
         lines = [f"I am Node {self.node_id}"]
