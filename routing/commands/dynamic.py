@@ -94,7 +94,10 @@ class ResetCommand(Command):
     def execute(self, node):
         with node.lock:
             node.graph = node.create_initial_graph()
+            node.immediate_neighbours = {nid for nid, _, _ in node.original_neighbours}
             node.failed_nodes.clear()
+            node.split_my_partition = None
+            node.merged_away_nodes.clear()
             node.is_up = True
             node.has_changes = True
             node.seq_num += 1

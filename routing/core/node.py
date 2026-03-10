@@ -35,13 +35,16 @@ class Node:
 
         # ── mutable state (protected by self.lock) ───────────────
         self.graph = self.create_initial_graph()
-        self.failed_nodes: set = set()
-        self.is_up: bool = True
-        self.has_changes: bool = True
-        self.seq_num: int = 0
-        self.last_routing_table: dict | None = None
-        self.suppress_routing_output: bool = False
-        self.running: bool = True
+        self.immediate_neighbours = {nid for nid, _, _ in self.original_neighbours}
+        self.failed_nodes = set()
+        self.is_up = True
+        self.has_changes = True
+        self.seq_num = 0
+        self.last_routing_table = None
+        self.suppress_routing_output = False
+        self.split_my_partition = None
+        self.merged_away_nodes = set()
+        self.running = True
 
         # ── synchronisation ──────────────────────────────────────
         self.lock = threading.RLock()
@@ -109,7 +112,7 @@ class Node:
         if line.startswith("UPDATE "):
             self._process_stdin_update(line)
         else:
-            command = CommandFactory.parse(line)  # may call error_exit
+            command = CommandFactory.parse(line)
             command.execute(self)
 
     # ── starting the node ────────────────────────────────────────
@@ -120,10 +123,8 @@ class Node:
             t = threading.Thread(target=target, daemon=True)
             t.start()
 
-        self._stdin_loop()  # blocks until EOF
+        self._stdin_loop()
 
-        # Keep the process alive so daemon threads can continue
-        # (the test harness will terminate the process when done).
         try:
             while True:
                 time.sleep(1)
@@ -157,7 +158,9 @@ class Node:
 
     def _routing_loop(self):
         time.sleep(self.routing_delay)
-        self.compute_and_output_routing_table(force=True)
+        with self.lock:
+            first_output = self.last_routing_table is None
+        self.compute_and_output_routing_table(force=first_output)
         while self.running:
             self.routing_event.wait(timeout=1.0)
             if self.routing_event.is_set():
@@ -167,15 +170,20 @@ class Node:
     # ── internal helpers ─────────────────────────────────────────
 
     def _broadcast_update(self):
-        """Print UPDATE to STDOUT and send topology to neighbours.
+        """Print UPDATE to STDOUT and send topology to immediate neighbours.
+
+        Only immediate neighbours (from config, modified by commands)
+        appear in the STDOUT UPDATE and receive socket messages.
 
         **Must** be called while holding ``self.lock``.
         """
-        neighbours = self.graph.get_neighbours(self.node_id)
         active = {}
-        for nid in sorted(neighbours):
+        for nid in sorted(self.immediate_neighbours):
             if nid not in self.failed_nodes:
-                active[nid] = (neighbours[nid], self.graph.get_port(nid))
+                cost = self.graph.get_cost(self.node_id, nid)
+                port = self.graph.get_port(nid)
+                if cost is not None and port is not None:
+                    active[nid] = (cost, port)
         update_str = Protocol.format_stdout_update(
             self.node_id, active, self.failed_nodes
         )
@@ -184,7 +192,7 @@ class Node:
         payload = Protocol.serialize_socket_message(
             self.node_id, self.graph, self.failed_nodes
         )
-        for nid in neighbours:
+        for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
                 port = self.graph.get_port(nid)
                 if port is not None:
@@ -196,14 +204,18 @@ class Node:
             source, neighbours = Protocol.parse_stdin_update(line)
         except ValueError as exc:
             error_exit(str(exc))
-            return  # unreachable, but keeps linters happy
+            return
 
         changed = False
         with self.lock:
+            if not self._accept_node(source):
+                return
             if not self.graph.has_node(source):
                 self.graph.add_node(source)
                 changed = True
             for nid, cost, port in neighbours:
+                if not self._accept_node(nid):
+                    continue
                 self.graph.add_node(nid, port)
                 old_cost = self.graph.get_cost(source, nid)
                 if old_cost is None or old_cost != cost:
@@ -212,19 +224,34 @@ class Node:
         if changed:
             self.routing_event.set()
 
+    def _accept_node(self, nid):
+        """Check if a node should be accepted based on split/merge state."""
+        if nid in self.merged_away_nodes:
+            return False
+        p = self.split_my_partition
+        if p is not None and nid not in p:
+            return False
+        return True
+
     def _process_socket_data(self, data):
-        """Handle raw bytes received on the UDP socket."""
+        """Handle raw bytes received on the UDP socket.
+
+        Updates the graph silently — routing table output is only
+        triggered by STDIN events (UPDATE packets relayed by the test
+        harness) and explicit commands, not by socket data.
+        """
         try:
             msg = Protocol.deserialize_socket_message(data)
         except Exception:
             return
 
-        changed = False
         with self.lock:
             topology = msg.get("topology", {})
             remote_failed = set(msg.get("failed", []))
 
             for nid, info in topology.items():
+                if not self._accept_node(nid):
+                    continue
                 port = info.get("port")
                 if port is not None:
                     self.graph.add_node(nid, port)
@@ -232,6 +259,8 @@ class Node:
                     self.graph.add_node(nid)
 
                 for n, ninfo in info.get("neighbours", {}).items():
+                    if not self._accept_node(n):
+                        continue
                     ncost = ninfo["cost"]
                     nport = ninfo.get("port")
                     if nport is not None:
@@ -241,15 +270,10 @@ class Node:
                     old = self.graph.get_cost(nid, n)
                     if old is None or old != ncost:
                         self.graph.add_edge(nid, n, ncost)
-                        changed = True
 
             for nid in remote_failed:
                 if nid not in self.failed_nodes:
                     self.failed_nodes.add(nid)
-                    changed = True
-
-        if changed:
-            self.routing_event.set()
 
     def _output_routing_table(self, routes):
         lines = [f"I am Node {self.node_id}"]

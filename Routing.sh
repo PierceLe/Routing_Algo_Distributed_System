@@ -1,3 +1,4 @@
 #!/bin/bash
-cd "$(dirname "$0")"
-python3 -m routing "$@"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+exec python3 -m routing "$@"
