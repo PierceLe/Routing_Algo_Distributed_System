@@ -165,6 +165,8 @@ class Node:
             self.routing_event.wait(timeout=1.0)
             if self.routing_event.is_set():
                 self.routing_event.clear()
+                time.sleep(0.1)
+                self.routing_event.clear()
                 self.compute_and_output_routing_table(force=False)
 
     # ── internal helpers ─────────────────────────────────────────
@@ -222,7 +224,7 @@ class Node:
                     self.graph.add_edge(source, nid, cost)
                     changed = True
         if changed:
-            self.routing_event.set()
+            self.compute_and_output_routing_table(force=False)
 
     def _accept_node(self, nid):
         """Check if a node should be accepted based on split/merge state."""
@@ -234,17 +236,13 @@ class Node:
         return True
 
     def _process_socket_data(self, data):
-        """Handle raw bytes received on the UDP socket.
-
-        Updates the graph silently — routing table output is only
-        triggered by STDIN events (UPDATE packets relayed by the test
-        harness) and explicit commands, not by socket data.
-        """
+        """Handle raw bytes received on the UDP socket."""
         try:
             msg = Protocol.deserialize_socket_message(data)
         except Exception:
             return
 
+        changed = False
         with self.lock:
             topology = msg.get("topology", {})
             remote_failed = set(msg.get("failed", []))
@@ -270,10 +268,15 @@ class Node:
                     old = self.graph.get_cost(nid, n)
                     if old is None or old != ncost:
                         self.graph.add_edge(nid, n, ncost)
+                        changed = True
 
             for nid in remote_failed:
                 if nid not in self.failed_nodes:
                     self.failed_nodes.add(nid)
+                    changed = True
+
+        if changed:
+            self.routing_event.set()
 
     def _output_routing_table(self, routes):
         lines = [f"I am Node {self.node_id}"]

@@ -93,7 +93,12 @@ class QueryPathCommand(Command):
 class ResetCommand(Command):
     def execute(self, node):
         with node.lock:
-            node.graph = node.create_initial_graph()
+            if node.node_id in node.graph._adj:
+                node.graph._adj[node.node_id] = {}
+            for nid, cost, port in node.original_neighbours:
+                node.graph.add_edge(node.node_id, nid, cost)
+                node.graph.set_port(nid, port)
+
             node.immediate_neighbours = {nid for nid, _, _ in node.original_neighbours}
             node.failed_nodes.clear()
             node.split_my_partition = None
