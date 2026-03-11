@@ -61,6 +61,11 @@ class Node:
         self.suppress_routing_output = False
         self.split_my_partition = None
         self.merged_away_nodes = set()
+        # Edges whose current cost was created/updated by a MERGE
+        # operation. For these, we never allow an older, higher-cost
+        # advertisement from the network to overwrite the cheaper cost.
+        # Stored as undirected pairs (min(u,v), max(u,v)).
+        self.merged_preferred_edges = set()
 
         # ── synchronisation ──────────────────────────────────────
         self.lock = threading.RLock()
@@ -108,6 +113,29 @@ class Node:
                 self._broadcast_update()
                 self.has_changes = False
 
+    def broadcast_split_partition(self, v1):
+        """Broadcast explicit SPLIT partition info to neighbours.
+
+        v1 is the first partition (as computed by the node that
+        executed SPLIT). All nodes that receive this payload will
+        apply the same V1/V2 rule to their local graphs.
+        """
+        with self.lock:
+            payload = Protocol.serialize_topology(
+                self.node_id,
+                self.graph,
+                self.failed_nodes,
+                merged_nodes=self.merged_away_nodes,
+                merged_into={},
+                split=True,
+                split_v1=v1,
+            )
+            for nid in self.immediate_neighbours:
+                if nid not in self.failed_nodes:
+                    port = self.graph.get_port(nid)
+                    if port is not None:
+                        self._socket.send(payload, port)
+
     def broadcast_merged_into(self, merged_into):
         """Broadcast merge info via socket only (no STDOUT).
 
@@ -122,6 +150,7 @@ class Node:
                 merged_nodes=set(),
                 merged_into=merged_into,
                 split=self.split_my_partition is not None,
+                split_v1=None,
             )
             for nid in self.immediate_neighbours:
                 if nid not in self.failed_nodes:
@@ -255,19 +284,20 @@ class Node:
 
     # ── internal helpers ─────────────────────────────────────────
 
-    def _apply_split_partition(self):
-        """Apply SPLIT partitioning locally based on current graph.
+    def _apply_split_partition_with_v1(self, v1):
+        """Apply SPLIT partition using an explicit V1 set.
 
         Returns True if the graph or immediate neighbours changed.
         Must be called while holding ``self.lock``.
         """
-        all_nodes = sorted(self.graph.get_nodes())
+        all_nodes = set(self.graph.get_nodes())
         if not all_nodes:
             return False
 
-        k = len(all_nodes) // 2
-        v1 = set(all_nodes[:k])
-        v2 = set(all_nodes[k:])
+        # Restrict V1 to nodes we actually know about; everything else
+        # in our view of the component belongs to V2.
+        v1 = set(v1) & all_nodes
+        v2 = all_nodes - v1
 
         edges_to_remove = []
         for u in v1:
@@ -294,6 +324,21 @@ class Node:
 
         return changed
 
+    def _apply_split_partition(self):
+        """Apply SPLIT partitioning locally based on current graph.
+
+        Computes V1, V2 from the current node set and delegates to
+        _apply_split_partition_with_v1.
+        Must be called while holding ``self.lock``.
+        """
+        all_nodes = sorted(self.graph.get_nodes())
+        if not all_nodes:
+            return False
+
+        k = len(all_nodes) // 2
+        v1 = set(all_nodes[:k])
+        return self._apply_split_partition_with_v1(v1)
+
     def _broadcast_update(self):
         """Print UPDATE to STDOUT and send topology to neighbours.
 
@@ -317,6 +362,7 @@ class Node:
             self.merged_away_nodes,
             merged_into={},
             split=self.split_my_partition is not None,
+            split_v1=None,
         )
         for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
@@ -338,6 +384,7 @@ class Node:
             self.merged_away_nodes,
             merged_into={},
             split=self.split_my_partition is not None,
+            split_v1=None,
         )
         for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
@@ -388,6 +435,7 @@ class Node:
             topology = msg.get("topology", {})
             remote_failed = set(msg.get("failed", []))
             split_flag = msg.get("split", False)
+            split_v1 = msg.get("split_v1", None)
 
             for nid, info in topology.items():
                 if not self._accept_node(nid):
@@ -402,9 +450,25 @@ class Node:
                     nport = ninfo.get("port")
                     self.graph.add_node(n, nport)
                     old = self.graph.get_cost(nid, n)
-                    if old is None or old != ncost:
+                    key = tuple(sorted((nid, n)))
+
+                    if old is None:
+                        # Edge unknown locally → always accept.
                         self.graph.add_edge(nid, n, ncost)
                         changed = True
+                    else:
+                        if key in self.merged_preferred_edges:
+                            # Edge cost was created by MERGE: only accept
+                            # strictly cheaper advertisements, never higher.
+                            if ncost < old:
+                                self.graph.add_edge(nid, n, ncost)
+                                changed = True
+                        else:
+                            # Normal edge: CHANGE / UPDATE may raise or lower
+                            # the cost, so accept any different value.
+                            if ncost != old:
+                                self.graph.add_edge(nid, n, ncost)
+                                changed = True
 
             for nid in remote_failed:
                 if nid not in self.failed_nodes:
@@ -431,12 +495,20 @@ class Node:
                     existing = self.graph.get_cost(into, nid)
                     if existing is None or cost < existing:
                         self.graph.add_edge(into, nid, cost)
+                        key = tuple(sorted((into, nid)))
+                        self.merged_preferred_edges.add(key)
                         changed = True
                 self.graph.remove_node(absorbed)
                 self.merged_away_nodes.add(absorbed)
                 changed = True
 
-            if split_flag:
+            # If explicit partition info is provided, use it so all
+            # nodes agree on the same V1/V2 split. Fall back to the
+            # local rule if only the boolean flag is present.
+            if split_v1 is not None:
+                if self._apply_split_partition_with_v1(set(split_v1)):
+                    changed = True
+            elif split_flag:
                 if self._apply_split_partition():
                     changed = True
 

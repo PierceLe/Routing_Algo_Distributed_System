@@ -34,6 +34,8 @@ class MergeCommand(Command):
                 existing = node.graph.get_cost(self.node_id1, nid)
                 if existing is None or cost < existing:
                     node.graph.add_edge(self.node_id1, nid, cost)
+                    key = tuple(sorted((self.node_id1, nid)))
+                    node.merged_preferred_edges.add(key)
 
             # 2) Redirect incoming edges: X -> B  becomes  X -> A
             for src in list(node.graph.get_nodes()):
@@ -46,6 +48,8 @@ class MergeCommand(Command):
                 existing = node.graph.get_cost(src, self.node_id1)
                 if existing is None or incoming_cost < existing:
                     node.graph.add_edge(src, self.node_id1, incoming_cost)
+                    key = tuple(sorted((src, self.node_id1)))
+                    node.merged_preferred_edges.add(key)
 
             # 3) Remove absorbed node completely
             node.graph.remove_node(self.node_id2)
@@ -87,26 +91,15 @@ class SplitCommand(Command):
 
     def execute(self, node):
         with node.lock:
-            # Broadcast a one-off SPLIT notification to all current
-            # immediate neighbours (including those that will be cut
-            # by the partition), so the split propagates across the
-            # connected component.
-            original_neighbours = list(node.immediate_neighbours)
-            split_payload = Protocol.serialize_topology(
-                node.node_id,
-                node.graph,
-                node.failed_nodes,
-                merged_nodes=node.merged_away_nodes,
-                merged_into={},
-                split=True,
-            )
-            for nid in original_neighbours:
-                if nid not in node.failed_nodes:
-                    port = node.graph.get_port(nid)
-                    if port is not None:
-                        node._socket.send(split_payload, port)
+            # Compute the global partition V1, V2 based on the current
+            # view of the component at this node, following the spec:
+            # 1) sort V, 2) k = floor(|V|/2), 3) V1 = first k nodes.
+            all_nodes = sorted(node.graph.get_nodes())
+            k = len(all_nodes) // 2
+            v1 = set(all_nodes[:k])
 
-            changed = node._apply_split_partition()
+            # Apply the partition locally.
+            changed = node._apply_split_partition_with_v1(v1)
 
             if changed:
                 node.has_changes = True
@@ -118,11 +111,14 @@ class SplitCommand(Command):
             else:
                 routes = None
 
+        # Broadcast the partition info to neighbours so they can apply
+        # the same V1/V2 rule to their local graphs.
+        node.broadcast_split_partition(v1)
+
         node.safe_print("Graph partitioned successfully.")
         if routes is not None:
             node._output_routing_table(routes)
         node.immediate_broadcast()
-
 
 class CycleDetectCommand(Command):
     """Check whether the current graph contains a cycle."""
