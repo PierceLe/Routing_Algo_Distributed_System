@@ -108,6 +108,23 @@ class Node:
                 self._broadcast_update()
                 self.has_changes = False
 
+    def broadcast_merged_into(self, merged_into):
+        """Broadcast merge info via socket only (no STDOUT).
+
+        Used when the absorbed node receives MERGE to propagate edge-transfer
+        info so other nodes can apply the merge.
+        """
+        with self.lock:
+            payload = Protocol.serialize_topology(
+                self.node_id, self.graph, self.failed_nodes,
+                merged_nodes=set(), merged_into=merged_into,
+            )
+            for nid in self.immediate_neighbours:
+                if nid not in self.failed_nodes:
+                    port = self.graph.get_port(nid)
+                    if port is not None:
+                        self._socket.send(payload, port)
+
     def compute_and_output_routing_table(self, *, force=False):
         """Compute shortest paths and print the routing table.
 
@@ -196,13 +213,22 @@ class Node:
                 self._process_socket_data(data)
 
     def _sending_loop(self):
-        """Periodically broadcast UPDATE to immediate neighbours."""
+        """Periodically broadcast UPDATE to immediate neighbours.
+
+        STDOUT UPDATE is printed only when immediate-neighbour config
+        changes (has_changes).  Socket topology is ALWAYS sent so that
+        learned link-state information propagates across multiple hops.
+        """
         while self._running:
             time.sleep(self.update_interval)
             with self.lock:
-                if self.has_changes and self.is_up:
+                if not self.is_up:
+                    continue
+                if self.has_changes:
                     self._broadcast_update()
                     self.has_changes = False
+                else:
+                    self._send_topology_via_socket()
 
     def _routing_loop(self):
         """Event-driven routing table computation.
@@ -242,7 +268,23 @@ class Node:
         self.safe_print(stdout_msg)
 
         payload = Protocol.serialize_topology(
-            self.node_id, self.graph, self.failed_nodes
+            self.node_id, self.graph, self.failed_nodes, self.merged_away_nodes
+        )
+        for nid in self.immediate_neighbours:
+            if nid not in self.failed_nodes:
+                port = self.graph.get_port(nid)
+                if port is not None:
+                    self._socket.send(payload, port)
+
+    def _send_topology_via_socket(self):
+        """Send full topology to neighbours via socket only (no STDOUT).
+
+        Used by the sending loop to propagate learned link-state info
+        even when the immediate-neighbour list hasn't changed.
+        Must be called while holding ``self.lock``.
+        """
+        payload = Protocol.serialize_topology(
+            self.node_id, self.graph, self.failed_nodes, self.merged_away_nodes
         )
         for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
@@ -314,6 +356,31 @@ class Node:
                 if nid not in self.failed_nodes:
                     self.failed_nodes.add(nid)
                     changed = True
+
+            for nid in msg.get("merged", []):
+                if nid not in self.merged_away_nodes:
+                    self.merged_away_nodes.add(nid)
+                    if self.graph.has_node(nid):
+                        self.graph.remove_node(nid)
+                        changed = True
+
+            for absorbed, into in msg.get("merged_into", {}).items():
+                if absorbed in self.merged_away_nodes:
+                    continue
+                if not self.graph.has_node(absorbed):
+                    self.merged_away_nodes.add(absorbed)
+                    continue
+                out = self.graph.get_neighbours(absorbed)
+                for nid, cost in out.items():
+                    if nid == into:
+                        continue
+                    existing = self.graph.get_cost(into, nid)
+                    if existing is None or cost < existing:
+                        self.graph.add_edge(into, nid, cost)
+                        changed = True
+                self.graph.remove_node(absorbed)
+                self.merged_away_nodes.add(absorbed)
+                changed = True
 
         if changed:
             self.routing_event.set()

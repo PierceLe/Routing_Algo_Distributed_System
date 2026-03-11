@@ -18,4 +18,4 @@ build/
 Thumbs.db
 
 # Test artifacts
-tests/batch_test.txt
+tests

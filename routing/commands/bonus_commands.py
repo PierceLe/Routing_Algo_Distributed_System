@@ -17,6 +17,12 @@ class MergeCommand(Command):
         self.node_id2 = node_id2
 
     def execute(self, node):
+        if node.node_id == self.node_id2:
+            node.safe_print("Graph merged successfully.")
+            node.compute_and_output_routing_table(force=True)
+            node.broadcast_merged_into({self.node_id2: self.node_id1})
+            return
+
         with node.lock:
             out_neighbours = node.graph.get_neighbours(self.node_id2)
 
