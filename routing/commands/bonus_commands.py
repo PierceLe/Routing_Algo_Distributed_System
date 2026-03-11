@@ -7,6 +7,7 @@ CYCLE DETECT: report whether the graph contains a cycle.
 
 from .base import Command
 from ..core.dijkstra import Dijkstra
+from ..network.protocol import Protocol
 
 
 class MergeCommand(Command):
@@ -17,6 +18,7 @@ class MergeCommand(Command):
         self.node_id2 = node_id2
 
     def execute(self, node):
+        # absorbed node still prints its own table, but informs others
         if node.node_id == self.node_id2:
             node.safe_print("Graph merged successfully.")
             node.compute_and_output_routing_table(force=True)
@@ -24,8 +26,8 @@ class MergeCommand(Command):
             return
 
         with node.lock:
+            # 1) Redirect outgoing edges: B -> X  becomes  A -> X
             out_neighbours = node.graph.get_neighbours(self.node_id2)
-
             for nid, cost in out_neighbours.items():
                 if nid == self.node_id1:
                     continue
@@ -33,16 +35,34 @@ class MergeCommand(Command):
                 if existing is None or cost < existing:
                     node.graph.add_edge(self.node_id1, nid, cost)
 
+            # 2) Redirect incoming edges: X -> B  becomes  X -> A
+            for src in list(node.graph.get_nodes()):
+                if src == self.node_id1 or src == self.node_id2:
+                    continue
+                incoming_cost = node.graph.get_cost(src, self.node_id2)
+                if incoming_cost is None:
+                    continue
+
+                existing = node.graph.get_cost(src, self.node_id1)
+                if existing is None or incoming_cost < existing:
+                    node.graph.add_edge(src, self.node_id1, incoming_cost)
+
+            # 3) Remove absorbed node completely
             node.graph.remove_node(self.node_id2)
             node.merged_away_nodes.add(self.node_id2)
 
+            # 4) Update immediate neighbours
             if self.node_id2 in node.immediate_neighbours:
                 node.immediate_neighbours.discard(self.node_id2)
-                if node.node_id == self.node_id1:
-                    for nid in out_neighbours:
-                        if nid != self.node_id1 and nid != node.node_id:
-                            node.immediate_neighbours.add(nid)
-                else:
+
+            if node.node_id == self.node_id1:
+                # absorber inherits absorbed node's outgoing neighbours
+                for nid in out_neighbours:
+                    if nid != self.node_id1 and nid != node.node_id:
+                        node.immediate_neighbours.add(nid)
+            else:
+                # other nodes should now point to node_id1 instead of node_id2 if needed
+                if node.graph.get_cost(node.node_id, self.node_id1) is not None:
                     node.immediate_neighbours.add(self.node_id1)
 
             node.has_changes = True
@@ -57,7 +77,9 @@ class MergeCommand(Command):
         node.safe_print("Graph merged successfully.")
         if routes is not None:
             node._output_routing_table(routes)
+
         node.immediate_broadcast()
+        node.broadcast_merged_into({self.node_id2: self.node_id1})
 
 
 class SplitCommand(Command):
@@ -65,26 +87,29 @@ class SplitCommand(Command):
 
     def execute(self, node):
         with node.lock:
-            all_nodes = sorted(node.graph.get_nodes())
-            k = len(all_nodes) // 2
-            v1 = set(all_nodes[:k])
-            v2 = set(all_nodes[k:])
+            # Broadcast a one-off SPLIT notification to all current
+            # immediate neighbours (including those that will be cut
+            # by the partition), so the split propagates across the
+            # connected component.
+            original_neighbours = list(node.immediate_neighbours)
+            split_payload = Protocol.serialize_topology(
+                node.node_id,
+                node.graph,
+                node.failed_nodes,
+                merged_nodes=node.merged_away_nodes,
+                merged_into={},
+                split=True,
+            )
+            for nid in original_neighbours:
+                if nid not in node.failed_nodes:
+                    port = node.graph.get_port(nid)
+                    if port is not None:
+                        node._socket.send(split_payload, port)
 
-            edges_to_remove = []
-            for u in v1:
-                for v in node.graph.get_neighbours(u):
-                    if v in v2:
-                        edges_to_remove.append((u, v))
+            changed = node._apply_split_partition()
 
-            for u, v in edges_to_remove:
-                node.graph.remove_edge(u, v)
-
-            my_partition = v1 if node.node_id in v1 else v2
-            other_partition = v2 if my_partition is v1 else v1
-            node.immediate_neighbours -= other_partition
-            node.split_my_partition = my_partition
-
-            node.has_changes = True
+            if changed:
+                node.has_changes = True
 
             if not node.suppress_routing_output:
                 filtered = node.get_filtered_graph()

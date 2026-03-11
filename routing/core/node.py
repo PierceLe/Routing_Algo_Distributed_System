@@ -116,8 +116,12 @@ class Node:
         """
         with self.lock:
             payload = Protocol.serialize_topology(
-                self.node_id, self.graph, self.failed_nodes,
-                merged_nodes=set(), merged_into=merged_into,
+                self.node_id,
+                self.graph,
+                self.failed_nodes,
+                merged_nodes=set(),
+                merged_into=merged_into,
+                split=self.split_my_partition is not None,
             )
             for nid in self.immediate_neighbours:
                 if nid not in self.failed_nodes:
@@ -251,6 +255,45 @@ class Node:
 
     # ── internal helpers ─────────────────────────────────────────
 
+    def _apply_split_partition(self):
+        """Apply SPLIT partitioning locally based on current graph.
+
+        Returns True if the graph or immediate neighbours changed.
+        Must be called while holding ``self.lock``.
+        """
+        all_nodes = sorted(self.graph.get_nodes())
+        if not all_nodes:
+            return False
+
+        k = len(all_nodes) // 2
+        v1 = set(all_nodes[:k])
+        v2 = set(all_nodes[k:])
+
+        edges_to_remove = []
+        for u in v1:
+            for v in self.graph.get_neighbours(u):
+                if v in v2:
+                    edges_to_remove.append((u, v))
+
+        changed = False
+        for u, v in edges_to_remove:
+            self.graph.remove_edge(u, v)
+            changed = True
+
+        my_partition = v1 if self.node_id in v1 else v2
+        other_partition = v2 if my_partition is v1 else v1
+
+        before_immediate = set(self.immediate_neighbours)
+        self.immediate_neighbours -= other_partition
+        if self.immediate_neighbours != before_immediate:
+            changed = True
+
+        if self.split_my_partition != my_partition:
+            self.split_my_partition = my_partition
+            changed = True
+
+        return changed
+
     def _broadcast_update(self):
         """Print UPDATE to STDOUT and send topology to neighbours.
 
@@ -268,7 +311,12 @@ class Node:
         self.safe_print(stdout_msg)
 
         payload = Protocol.serialize_topology(
-            self.node_id, self.graph, self.failed_nodes, self.merged_away_nodes
+            self.node_id,
+            self.graph,
+            self.failed_nodes,
+            self.merged_away_nodes,
+            merged_into={},
+            split=self.split_my_partition is not None,
         )
         for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
@@ -284,7 +332,12 @@ class Node:
         Must be called while holding ``self.lock``.
         """
         payload = Protocol.serialize_topology(
-            self.node_id, self.graph, self.failed_nodes, self.merged_away_nodes
+            self.node_id,
+            self.graph,
+            self.failed_nodes,
+            self.merged_away_nodes,
+            merged_into={},
+            split=self.split_my_partition is not None,
         )
         for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
@@ -334,6 +387,7 @@ class Node:
         with self.lock:
             topology = msg.get("topology", {})
             remote_failed = set(msg.get("failed", []))
+            split_flag = msg.get("split", False)
 
             for nid, info in topology.items():
                 if not self._accept_node(nid):
@@ -381,6 +435,10 @@ class Node:
                 self.graph.remove_node(absorbed)
                 self.merged_away_nodes.add(absorbed)
                 changed = True
+
+            if split_flag:
+                if self._apply_split_partition():
+                    changed = True
 
         if changed:
             self.routing_event.set()

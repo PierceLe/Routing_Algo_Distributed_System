@@ -4,8 +4,7 @@ STDOUT format (spec-mandated, immediate neighbours only):
     UPDATE <Node-ID> <N1>:<Cost1>:<Port1>,<N2>:<Cost2>:<Port2>,...
 
 Socket format (link-state, full topology as JSON):
-    {"source": "A", "topology": {...}, "failed": [...], "merged": [...],
-     "merged_into": {"B": "A"}  # B absorbed into A — for edge transfer}
+    {"source": "A", "topology": {...}, "failed": [...], "merged": [...]}
 """
 
 import json
@@ -62,8 +61,14 @@ class Protocol:
     # ── Socket (JSON, link-state topology) ───────────────────────
 
     @staticmethod
-    def serialize_topology(source, graph, failed_nodes, merged_nodes=None,
-                          merged_into=None):
+    def serialize_topology(
+        source,
+        graph,
+        failed_nodes,
+        merged_nodes=None,
+        merged_into=None,
+        split=False,
+    ):
         """Encode full known topology as JSON bytes for socket."""
         if merged_nodes is None:
             merged_nodes = set()
@@ -84,6 +89,7 @@ class Protocol:
             "failed": list(failed_nodes),
             "merged": list(merged_nodes),
             "merged_into": merged_into,
+            "split": bool(split),
         }
         return json.dumps(payload).encode("utf-8")
 
