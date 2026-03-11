@@ -1,9 +1,9 @@
-"""Entry point: validate CLI arguments and launch the node."""
+"""Entry point: validate CLI arguments, parse config, and launch the node."""
 
 import sys
 
 from .utils import validate_node_id, error_exit
-from .core import Node
+from .config import ConfigParser
 
 
 def main():
@@ -36,9 +36,9 @@ def main():
     except ValueError:
         error_exit("Error: Invalid UpdateInterval. Must be a number.")
 
-    node = Node(node_id, port, config_file, routing_delay, update_interval)
+    original_neighbours = ConfigParser.parse(config_file)
+
+    from .core import Node
+    node = Node(node_id, port, config_file, original_neighbours,
+                routing_delay, update_interval)
     node.start()
-
-
-if __name__ == "__main__":
-    main()

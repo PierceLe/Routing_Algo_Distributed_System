@@ -1,74 +1,91 @@
-"""Node: the central orchestrator that owns the graph, threads, and I/O."""
+"""Node: the central orchestrator that owns the graph, threads, and I/O.
+
+Thread Safety
+-------------
+All mutable state is protected by ``self.lock`` (an RLock).
+Any code reading or writing these attributes must hold the lock:
+
+    graph, immediate_neighbours, failed_nodes, is_up,
+    has_changes, last_routing_table, suppress_routing_output,
+    split_my_partition, merged_away_nodes
+
+Threading Model
+---------------
+Four threads as required by the spec:
+
+1. **Main thread** — reads STDIN (Listening Thread, part 1)
+2. **Socket listener** — reads UDP socket (Listening Thread, part 2)
+3. **Sending thread** — periodic UPDATE broadcast every ``update_interval``
+4. **Routing calculator** — event-driven via ``routing_event`` (no polling)
+
+Synchronisation Primitives
+--------------------------
+- ``lock`` (RLock): protects all shared mutable state
+- ``routing_event`` (Event): signals routing thread to recompute
+- ``_print_lock`` (Lock): serialises multi-line STDOUT output
+
+No hardcoded sleep/buffer times. The only sleeps use CLI-provided
+``routing_delay`` and ``update_interval``.
+"""
 
 import sys
 import threading
 import time
 
 from .graph import Graph
-from .router import Router
-from ..network import NetworkManager, Protocol
-from ..config import ConfigParser
-from ..commands import CommandFactory
+from .dijkstra import Dijkstra
+from ..network.protocol import Protocol
+from ..network.udp_socket import UDPSocket
 from ..utils import format_cost, error_exit
 
 
 class Node:
-    """Represents a single routing node in the network.
 
-    Responsibilities
-    ----------------
-    * Maintain the full known topology (link-state database).
-    * Run four concurrent threads: STDIN reader, socket listener,
-      periodic sender, and routing calculator.
-    * Process dynamic commands and UPDATE packets.
-    """
-
-    def __init__(self, node_id, port, config_file, routing_delay, update_interval):
+    def __init__(self, node_id, port, config_file, original_neighbours,
+                 routing_delay, update_interval):
+        # ── immutable configuration ──────────────────────────────
         self.node_id = node_id
         self.port = port
         self.config_file = config_file
+        self.original_neighbours = original_neighbours
         self.routing_delay = routing_delay
         self.update_interval = update_interval
 
-        # ── persistent config (for RESET) ────────────────────────
-        self.original_neighbours = ConfigParser.parse(config_file)
-
         # ── mutable state (protected by self.lock) ───────────────
-        self.graph = self.create_initial_graph()
-        self.immediate_neighbours = {nid for nid, _, _ in self.original_neighbours}
+        self.graph = self._build_initial_graph()
+        self.immediate_neighbours = {nid for nid, _, _ in original_neighbours}
         self.failed_nodes = set()
         self.is_up = True
         self.has_changes = True
-        self.seq_num = 0
         self.last_routing_table = None
         self.suppress_routing_output = False
         self.split_my_partition = None
         self.merged_away_nodes = set()
-        self.running = True
 
         # ── synchronisation ──────────────────────────────────────
         self.lock = threading.RLock()
         self.routing_event = threading.Event()
         self._print_lock = threading.Lock()
+        self._running = True
+        self._shutdown = threading.Event()
 
         # ── networking ───────────────────────────────────────────
-        self.network = NetworkManager(port)
+        self._socket = UDPSocket(port)
 
     # ── graph helpers ────────────────────────────────────────────
 
-    def create_initial_graph(self):
-        """Build a graph containing only self and direct neighbours."""
+    def _build_initial_graph(self):
         g = Graph()
         g.add_node(self.node_id, self.port)
-        for nid, cost, port in self.original_neighbours:
+        for nid, cost, nport in self.original_neighbours:
             g.add_edge(self.node_id, nid, cost)
-            g.set_port(nid, port)
+            g.set_port(nid, nport)
         return g
 
     def get_filtered_graph(self):
         """Return a copy of the graph with failed nodes removed.
 
-        **Must** be called while holding ``self.lock``.
+        Must be called while holding ``self.lock``.
         """
         g = self.graph.copy()
         for nid in self.failed_nodes:
@@ -78,10 +95,11 @@ class Node:
     # ── thread-safe output ───────────────────────────────────────
 
     def safe_print(self, message):
+        """Atomic multi-line print to STDOUT."""
         with self._print_lock:
             print(message, flush=True)
 
-    # ── public helpers used by Command objects ───────────────────
+    # ── public interface for commands ────────────────────────────
 
     def immediate_broadcast(self):
         """Send the UPDATE packet right now (STDOUT + sockets)."""
@@ -91,49 +109,77 @@ class Node:
                 self.has_changes = False
 
     def compute_and_output_routing_table(self, *, force=False):
-        """Compute shortest paths and print the table.
+        """Compute shortest paths and print the routing table.
 
-        With *force=True* the table is always printed (used by commands).
-        With *force=False* the table is printed only when it differs from
-        the previous output (used by the background routing thread).
+        force=True: always print (used by commands).
+        force=False: only print if table changed (used by routing thread).
+
+        Respects ``suppress_routing_output`` for BATCH UPDATE.
         """
-        if self.suppress_routing_output:
-            return
         with self.lock:
+            if self.suppress_routing_output:
+                return
             filtered = self.get_filtered_graph()
-            routes = Router.compute_shortest_paths(filtered, self.node_id)
+            routes = Dijkstra.compute(filtered, self.node_id)
             changed = routes != self.last_routing_table
             self.last_routing_table = routes
         if force or changed:
             self._output_routing_table(routes)
 
+    _KNOWN_COMMANDS = frozenset({
+        "CHANGE", "FAIL", "RECOVER", "QUERY", "RESET",
+        "MERGE", "SPLIT", "BATCH", "CYCLE",
+    })
+
+    @staticmethod
+    def _looks_like_update_packet(line):
+        """Heuristic: line contains colon-separated neighbor entries."""
+        for token in line.split():
+            if token.count(":") >= 2:
+                return True
+        return False
+
     def process_input(self, line):
         """Dispatch a single STDIN line to the right handler."""
         if line.startswith("UPDATE "):
             self._process_stdin_update(line)
-        else:
-            command = CommandFactory.parse(line)
-            command.execute(self)
+            return
+
+        first_token = line.split(maxsplit=1)[0] if line else ""
+        if first_token not in self._KNOWN_COMMANDS:
+            if self._looks_like_update_packet(line):
+                error_exit("Error: Invalid update packet format.")
+            error_exit("Error: Invalid command format. "
+                       "Expected numeric cost value.")
+
+        from ..commands.factory import CommandFactory
+        command = CommandFactory.parse(line)
+        command.execute(self)
 
     # ── starting the node ────────────────────────────────────────
 
     def start(self):
-        """Launch all background threads, then read STDIN in the main thread."""
-        for target in (self._socket_listener, self._sending_loop, self._routing_loop):
+        """Launch background threads, then read STDIN in the main thread."""
+        for target in (self._socket_listener,
+                       self._sending_loop,
+                       self._routing_loop):
             t = threading.Thread(target=target, daemon=True)
             t.start()
 
         self._stdin_loop()
 
         try:
-            while True:
-                time.sleep(1)
+            self._shutdown.wait()
         except KeyboardInterrupt:
-            self.running = False
+            pass
+        finally:
+            self._running = False
+            self.routing_event.set()
 
     # ── thread bodies ────────────────────────────────────────────
 
     def _stdin_loop(self):
+        """Main thread: read STDIN lines and dispatch."""
         try:
             for line in sys.stdin:
                 line = line.strip()
@@ -143,13 +189,15 @@ class Node:
             pass
 
     def _socket_listener(self):
-        while self.running:
-            data = self.network.receive()
+        """Read UDP messages from neighbouring nodes."""
+        while self._running:
+            data = self._socket.receive()
             if data is not None:
                 self._process_socket_data(data)
 
     def _sending_loop(self):
-        while self.running:
+        """Periodically broadcast UPDATE to immediate neighbours."""
+        while self._running:
             time.sleep(self.update_interval)
             with self.lock:
                 if self.has_changes and self.is_up:
@@ -157,28 +205,30 @@ class Node:
                     self.has_changes = False
 
     def _routing_loop(self):
+        """Event-driven routing table computation.
+
+        1. Sleep for RoutingDelay, then output initial routing table.
+        2. Block on routing_event.wait() — wakes ONLY when signalled
+           by UPDATE handlers (no polling, no hardcoded timeout).
+        3. Recompute and output only if the table actually changed.
+        """
         time.sleep(self.routing_delay)
-        time.sleep(0.1)
-        with self.lock:
-            first_output = self.last_routing_table is None
-        self.compute_and_output_routing_table(force=first_output)
-        while self.running:
-            self.routing_event.wait(timeout=1.0)
-            if self.routing_event.is_set():
-                self.routing_event.clear()
-                time.sleep(0.05)
-                self.routing_event.clear()
-                self.compute_and_output_routing_table(force=False)
+        self.routing_event.clear()
+        self.compute_and_output_routing_table(force=True)
+
+        while self._running:
+            self.routing_event.wait()
+            if not self._running:
+                break
+            self.routing_event.clear()
+            self.compute_and_output_routing_table(force=False)
 
     # ── internal helpers ─────────────────────────────────────────
 
     def _broadcast_update(self):
-        """Print UPDATE to STDOUT and send topology to immediate neighbours.
+        """Print UPDATE to STDOUT and send topology to neighbours.
 
-        Only immediate neighbours (from config, modified by commands)
-        appear in the STDOUT UPDATE and receive socket messages.
-
-        **Must** be called while holding ``self.lock``.
+        Must be called while holding ``self.lock``.
         """
         active = {}
         for nid in sorted(self.immediate_neighbours):
@@ -187,22 +237,21 @@ class Node:
                 port = self.graph.get_port(nid)
                 if cost is not None and port is not None:
                     active[nid] = (cost, port)
-        update_str = Protocol.format_stdout_update(
-            self.node_id, active, self.failed_nodes
-        )
-        self.safe_print(update_str)
 
-        payload = Protocol.serialize_socket_message(
+        stdout_msg = Protocol.format_stdout_update(self.node_id, active)
+        self.safe_print(stdout_msg)
+
+        payload = Protocol.serialize_topology(
             self.node_id, self.graph, self.failed_nodes
         )
         for nid in self.immediate_neighbours:
             if nid not in self.failed_nodes:
                 port = self.graph.get_port(nid)
                 if port is not None:
-                    self.network.send(payload, port)
+                    self._socket.send(payload, port)
 
     def _process_stdin_update(self, line):
-        """Handle an ``UPDATE`` packet arriving via STDIN."""
+        """Handle an UPDATE packet arriving via STDIN."""
         try:
             source, neighbours = Protocol.parse_stdin_update(line)
         except ValueError as exc:
@@ -224,29 +273,22 @@ class Node:
                 if old_cost is None or old_cost != cost:
                     self.graph.add_edge(source, nid, cost)
                     changed = True
+
         if changed:
             self.routing_event.set()
 
-    def _accept_node(self, nid):
-        """Check if a node should be accepted based on split/merge state."""
-        if nid in self.merged_away_nodes:
-            return False
-        p = self.split_my_partition
-        if p is not None and nid not in p:
-            return False
-        return True
-
     def _process_socket_data(self, data):
-        """Handle raw bytes received on the UDP socket.
+        """Handle topology data received on the UDP socket.
 
-        Updates the graph silently for internal convergence.
-        Output is only triggered by STDIN events and commands.
+        Merges received topology into local graph.
+        Signals routing thread only if graph actually changed.
         """
         try:
-            msg = Protocol.deserialize_socket_message(data)
+            msg = Protocol.deserialize_topology(data)
         except Exception:
             return
 
+        changed = False
         with self.lock:
             topology = msg.get("topology", {})
             remote_failed = set(msg.get("failed", []))
@@ -255,29 +297,41 @@ class Node:
                 if not self._accept_node(nid):
                     continue
                 port = info.get("port")
-                if port is not None:
-                    self.graph.add_node(nid, port)
-                else:
-                    self.graph.add_node(nid)
+                self.graph.add_node(nid, port)
 
                 for n, ninfo in info.get("neighbours", {}).items():
                     if not self._accept_node(n):
                         continue
                     ncost = ninfo["cost"]
                     nport = ninfo.get("port")
-                    if nport is not None:
-                        self.graph.add_node(n, nport)
-                    else:
-                        self.graph.add_node(n)
+                    self.graph.add_node(n, nport)
                     old = self.graph.get_cost(nid, n)
                     if old is None or old != ncost:
                         self.graph.add_edge(nid, n, ncost)
+                        changed = True
 
             for nid in remote_failed:
                 if nid not in self.failed_nodes:
                     self.failed_nodes.add(nid)
+                    changed = True
+
+        if changed:
+            self.routing_event.set()
+
+    def _accept_node(self, nid):
+        """Filter nodes based on split/merge state.
+
+        Must be called while holding ``self.lock``.
+        """
+        if nid in self.merged_away_nodes:
+            return False
+        p = self.split_my_partition
+        if p is not None and nid not in p:
+            return False
+        return True
 
     def _output_routing_table(self, routes):
+        """Format and print the routing table."""
         lines = [f"I am Node {self.node_id}"]
         for dest in sorted(routes):
             cost, path = routes[dest]

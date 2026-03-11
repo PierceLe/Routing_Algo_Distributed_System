@@ -1,4 +1,11 @@
-"""Message serialisation for STDIN/STDOUT and UDP socket communication."""
+"""Message serialisation for STDIN/STDOUT and UDP socket communication.
+
+STDOUT format (spec-mandated, immediate neighbours only):
+    UPDATE <Node-ID> <N1>:<Cost1>:<Port1>,<N2>:<Cost2>:<Port2>,...
+
+Socket format (link-state, full topology as JSON):
+    {"source": "A", "topology": {...}, "failed": [...]}
+"""
 
 import json
 
@@ -6,34 +13,29 @@ from ..utils import format_cost
 
 
 class Protocol:
-    """Handles encoding / decoding of update packets and topology data."""
 
-    # ── STDOUT / STDIN update packets ────────────────────────────
+    # ── STDOUT / STDIN ───────────────────────────────────────────
 
     @staticmethod
-    def format_stdout_update(node_id, neighbours, failed_nodes=None):
-        """Build the STDOUT ``UPDATE`` line.
+    def format_stdout_update(node_id, neighbours):
+        """Build the spec-mandated UPDATE line for STDOUT.
 
-        *neighbours* is ``{nid: (cost, port)}``.
-        Failed neighbours are excluded.
+        neighbours: {nid: (cost, port)} — only active immediate neighbours.
         """
-        if failed_nodes is None:
-            failed_nodes = set()
         parts = []
         for nid in sorted(neighbours):
-            if nid not in failed_nodes:
-                cost, port = neighbours[nid]
-                parts.append(f"{nid}:{format_cost(cost)}:{port}")
+            cost, port = neighbours[nid]
+            parts.append(f"{nid}:{format_cost(cost)}:{port}")
         if parts:
             return f"UPDATE {node_id} {','.join(parts)}"
         return f"UPDATE {node_id}"
 
     @staticmethod
     def parse_stdin_update(line):
-        """Parse ``UPDATE <src> <N1:C1:P1>,…`` from STDIN.
+        """Parse an UPDATE packet from STDIN.
 
-        Returns ``(source, [(nid, cost, port), …])``.
-        Raises ``ValueError`` with the spec error message on bad format.
+        Returns (source, [(nid, cost, port), ...]).
+        Raises ValueError with the spec error message on bad format.
         """
         parts = line.split(maxsplit=2)
         if len(parts) < 2 or parts[0] != "UPDATE":
@@ -56,11 +58,11 @@ class Protocol:
 
         return source, neighbours
 
-    # ── Socket (JSON) messages ───────────────────────────────────
+    # ── Socket (JSON, link-state topology) ───────────────────────
 
     @staticmethod
-    def serialize_socket_message(source, graph, failed_nodes):
-        """Encode the full known topology as a JSON byte string."""
+    def serialize_topology(source, graph, failed_nodes):
+        """Encode full known topology as JSON bytes for socket."""
         topology = {}
         for nid in graph.get_nodes():
             topology[nid] = {
@@ -78,6 +80,6 @@ class Protocol:
         return json.dumps(payload).encode("utf-8")
 
     @staticmethod
-    def deserialize_socket_message(data):
-        """Decode a JSON byte string back to a dict."""
+    def deserialize_topology(data):
+        """Decode JSON bytes from socket."""
         return json.loads(data.decode("utf-8"))

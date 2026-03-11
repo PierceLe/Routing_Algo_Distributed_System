@@ -22,65 +22,114 @@ Example:
 |------------------|-----------------------------------------------------------|
 | Node-ID          | Single uppercase letter (A–Z)                             |
 | Port-NO          | Integer port the node listens on (starting from 6000)     |
-| Node-Config-File | File listing immediate neighbours (see spec §3.2)         |
+| Node-Config-File | File listing immediate neighbours (see spec Section 3.2)  |
 | RoutingDelay     | Seconds to wait before the first routing-table output     |
 | UpdateInterval   | Seconds between periodic UPDATE broadcasts                |
 
 ## Project Structure
 
-    Routing.sh                  Entry-point wrapper script
-    README                      This file
-    routing/
-      __init__.py               Top-level package marker
-      __main__.py               Allows `python3 -m routing`
-      main.py                   CLI argument parsing and validation
-      core/                     Core data structures & orchestration
-        graph.py                  Undirected weighted graph (adjacency list)
-        router.py                 Dijkstra shortest-path computation
-        node.py                   Node class (orchestrator, threading)
-      commands/                 Command pattern implementation
-        base.py                   Abstract Command base class
-        dynamic.py                CHANGE, FAIL, RECOVER, QUERY, RESET, …
-        bonus.py                  MERGE, SPLIT, CYCLE DETECT
-        factory.py                CommandFactory input parser
-      network/                  Network communication layer
-        socket_manager.py         UDP socket wrapper
-        protocol.py               STDIN/STDOUT and socket message formats
-      config/                   Configuration handling
-        parser.py                 Config-file parser and validator
-      utils/                    Shared helpers
-        validation.py             Node-ID validation
-        formatting.py             Cost formatting and error_exit
+    mini_router_system/
+    ├── .gitignore
+    ├── Routing.sh                          # Entry point: ./Routing.sh <args>
+    ├── README                              # This file
+    │
+    ├── document/
+    │   ├── 2026_COMP3221_Assignment1_v3.2.pdf
+    │   └── submission.md
+    │
+    ├── routing/                            # Main package
+    │   ├── __init__.py
+    │   ├── __main__.py                     # python3 -m routing
+    │   ├── main.py                         # CLI arg validation → launches Node
+    │   │
+    │   ├── config/
+    │   │   ├── __init__.py
+    │   │   └── parser.py                   # Config file parser (Appendix A errors)
+    │   │
+    │   ├── core/
+    │   │   ├── __init__.py
+    │   │   ├── graph.py                    # Undirected weighted graph
+    │   │   ├── dijkstra.py                 # Shortest-path algorithm (Strategy)
+    │   │   └── node.py                     # Orchestrator: 4 threads + shared state
+    │   │
+    │   ├── network/
+    │   │   ├── __init__.py
+    │   │   ├── protocol.py                 # STDOUT/STDIN + JSON socket format
+    │   │   └── udp_socket.py               # UDP socket wrapper
+    │   │
+    │   ├── commands/
+    │   │   ├── __init__.py
+    │   │   ├── base.py                     # Abstract Command (Command pattern)
+    │   │   ├── factory.py                  # CommandFactory (Factory pattern)
+    │   │   ├── core_commands.py            # CHANGE, FAIL, RECOVER, QUERY, RESET, BATCH
+    │   │   └── bonus_commands.py           # MERGE, SPLIT, CYCLE DETECT
+    │   │
+    │   └── utils/
+    │       ├── __init__.py
+    │       ├── validation.py               # validate_node_id
+    │       └── formatting.py               # format_cost, error_exit
+    │
+    └── tests/
+        ├── configs/
+        │   ├── Aconfig.txt                 # A: B(5.0), C(10.0)
+        │   ├── Bconfig.txt                 # B: A(5.0), C(3.0)
+        │   ├── Cconfig.txt                 # C: A(10.0), B(3.0)
+        │   └── Fconfig.txt                 # F: A(2.3), C(3.2), E(2.8), J(5.4)
+        ├── test_phase2.py                  # Graph + Dijkstra unit tests
+        ├── test_phase3.py                  # Threading + UPDATE integration
+        ├── test_phase4.py                  # Core dynamic commands
+        ├── test_phase5.py                  # Bonus commands
+        └── test_phase6.py                  # Appendix B error handling
+
+## Design Overview
+
+The solution uses a **link-state** approach: each node shares its full known
+topology with direct neighbours over UDP, so every node can eventually
+learn the entire graph and run Dijkstra locally.
+
+### Design Patterns
+
+| Pattern   | Location              | Purpose                                      |
+|-----------|-----------------------|----------------------------------------------|
+| Command   | commands/base.py      | Each command is an object with execute(node)  |
+| Strategy  | core/dijkstra.py      | Routing algorithm is swappable                |
+| Factory   | commands/factory.py   | Parses STDIN into typed Command objects       |
+| Facade    | core/node.py          | Node is the single entry point for all state  |
+
+### Threading Model
+
+Four threads run concurrently (no hardcoded sleep/buffer times):
+
+| Thread              | Role                                       | Sync Mechanism            |
+|---------------------|--------------------------------------------|---------------------------|
+| Main (STDIN)        | Reads commands and UPDATE packets          | Direct calls              |
+| Socket listener     | Receives topology from neighbours via UDP  | lock + routing_event.set  |
+| Sender              | Broadcasts UPDATE every UpdateInterval     | lock + has_changes flag   |
+| Routing calculator  | Computes Dijkstra when signalled           | routing_event.wait()      |
+
+### Synchronisation Primitives
+
+| Primitive       | Type    | Purpose                                          |
+|-----------------|---------|--------------------------------------------------|
+| lock            | RLock   | Protects all shared mutable state                |
+| routing_event   | Event   | Signals routing thread (no polling)              |
+| _print_lock     | Lock    | Prevents interleaved multi-line STDOUT output    |
+
+Lock ordering: lock -> _print_lock (never reversed, prevents deadlock).
 
 ## Supported Commands
 
 All commands from the spec are implemented:
 
-| Command        | Description                                      |
-|----------------|--------------------------------------------------|
-| CHANGE         | Update the cost of an edge to a neighbour        |
-| FAIL           | Mark a node as down (stop broadcasts if self)    |
-| RECOVER        | Bring a node back up                             |
-| QUERY          | Print least-cost path from this node             |
-| QUERY PATH     | Print least-cost path between any two nodes      |
-| RESET          | Restore original config and re-broadcast         |
-| BATCH UPDATE   | Process a file of commands sequentially           |
-| MERGE (bonus)  | Absorb one node into another                     |
-| SPLIT (bonus)  | Partition the graph alphabetically                |
-| CYCLE DETECT (bonus) | Report whether the graph contains a cycle   |
-
-## Design Overview
-
-The solution uses a link-state approach: each node shares its full known
-topology with direct neighbours over UDP, so every node can eventually
-learn the entire graph and run Dijkstra locally.
-
-Four threads run concurrently:
-
-1. Main / STDIN thread – reads commands and UPDATE packets.
-2. Socket listener (daemon) – receives topology data from neighbours.
-3. Sender (daemon) – broadcasts UPDATE packets every UpdateInterval seconds.
-4. Routing calculator (daemon) – re-runs Dijkstra when topology changes.
-
-Thread safety is ensured with an RLock on shared state and a separate lock
-on print output to prevent interleaving.
+| Command              | Description                                      |
+|----------------------|--------------------------------------------------|
+| CHANGE               | Update the cost of an edge to a neighbour        |
+| FAIL                 | Mark a node as down (stop broadcasts if self)    |
+| RECOVER              | Bring a node back up                             |
+| QUERY                | Print least-cost path from this node             |
+| QUERY PATH           | Print least-cost path between any two nodes      |
+| RESET                | Restore original config and re-broadcast         |
+| BATCH UPDATE         | Process a file of commands sequentially           |
+| MERGE (bonus)        | Absorb one node into another                     |
+| SPLIT (bonus)        | Partition the graph alphabetically               |
+| CYCLE DETECT (bonus) | Report whether the graph contains a cycle        |

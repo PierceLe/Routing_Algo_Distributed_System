@@ -1,18 +1,15 @@
-"""Node configuration file parser with spec-compliant error handling."""
-
 from ..utils import validate_node_id, error_exit
 
 
 class ConfigParser:
-    """Parse and validate the neighbour configuration file."""
+    """Parse and validate the neighbour configuration file.
+
+    Returns a list of (node_id, cost, port) tuples.
+    Exits with spec-compliant error messages on any invalid input.
+    """
 
     @staticmethod
     def parse(filepath):
-        """Return a list of ``(node_id, cost, port)`` tuples.
-
-        Calls :func:`error_exit` with the exact messages required by the
-        assignment spec if the file is missing or malformed.
-        """
         try:
             with open(filepath, "r") as fh:
                 lines = fh.readlines()
@@ -44,9 +41,10 @@ class ConfigParser:
 
             tokens = lines[i].strip().split()
 
+            if len(tokens) > 3:
+                error_exit("Error: Invalid configuration file format.")
+
             if len(tokens) != 3:
-                if len(tokens) > 3:
-                    error_exit("Error: Invalid configuration file format.")
                 error_exit(
                     "Error: Invalid configuration file format. "
                     "(Each neighbour entry must have exactly three "

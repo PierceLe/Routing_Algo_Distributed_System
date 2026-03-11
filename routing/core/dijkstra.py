@@ -1,18 +1,26 @@
-"""Shortest-path computation using Dijkstra's algorithm."""
+"""Shortest-path computation using Dijkstra's algorithm.
+
+Implements the Strategy pattern: the routing algorithm is a pluggable
+component that can be swapped (e.g. to Bellman-Ford) without changing
+the rest of the system.
+"""
 
 import heapq
 
 
-class Router:
-    """Stateless helper that runs Dijkstra on a Graph."""
+class Dijkstra:
+    """Stateless shortest-path calculator.
+
+    Computes single-source shortest paths on a Graph.
+    Ties at equal cost are broken alphabetically by node ID.
+    """
 
     @staticmethod
-    def compute_shortest_paths(graph, source):
+    def compute(graph, source):
         """Return {dest: (cost, path_str)} for every reachable node.
 
-        *path_str* is the concatenation of node IDs along the path
-        (e.g. ``"ABCD"``).  Ties are broken alphabetically via the
-        ``(distance, node_id)`` heap key.
+        path_str is the concatenated node IDs (e.g. "ABCD").
+        The source node itself is excluded from the results.
         """
         nodes = graph.get_nodes()
         if source not in nodes:
@@ -21,6 +29,7 @@ class Router:
         dist = {n: float("inf") for n in nodes}
         prev = {n: None for n in nodes}
         dist[source] = 0.0
+
         pq = [(0.0, source)]
         visited = set()
 
@@ -33,7 +42,9 @@ class Router:
                 if v in visited:
                     continue
                 new_dist = d + cost
-                if new_dist < dist[v]:
+                if new_dist < dist[v] or (
+                    new_dist == dist[v] and u < (prev[v] or "")
+                ):
                     dist[v] = new_dist
                     prev[v] = u
                     heapq.heappush(pq, (new_dist, v))
@@ -49,4 +60,5 @@ class Router:
                 cur = prev[cur]
             path.reverse()
             results[dest] = (dist[dest], "".join(path))
+
         return results

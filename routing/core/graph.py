@@ -1,15 +1,15 @@
-"""Directed weighted graph representing the network topology."""
+"""Undirected weighted graph representing the network topology.
+
+The graph is simple (no self-loops, no parallel edges) and undirected:
+every add_edge(u, v, cost) stores both u->v and v->u symmetrically.
+"""
 
 
 class Graph:
-    """Adjacency-list directed graph with per-node port metadata.
-
-    Each edge u→v is stored only in ``_adj[u][v]``; there is no
-    automatic reverse edge.
-    """
+    __slots__ = ("_adj", "_ports")
 
     def __init__(self):
-        self._adj = {}      # node_id -> {target_id: cost}
+        self._adj = {}      # node_id -> {neighbour_id: cost}
         self._ports = {}    # node_id -> port (int)
 
     # ── node operations ──────────────────────────────────────────
@@ -21,9 +21,10 @@ class Graph:
             self._ports[node_id] = port
 
     def remove_node(self, node_id):
-        self._adj.pop(node_id, None)
-        for nid in self._adj:
-            self._adj[nid].pop(node_id, None)
+        neighbours = self._adj.pop(node_id, {})
+        for nid in neighbours:
+            if nid in self._adj:
+                self._adj[nid].pop(node_id, None)
         self._ports.pop(node_id, None)
 
     def has_node(self, node_id):
@@ -38,27 +39,29 @@ class Graph:
     def set_port(self, node_id, port):
         self._ports[node_id] = port
 
-    # ── edge operations ──────────────────────────────────────────
+    # ── edge operations (undirected) ─────────────────────────────
 
     def add_edge(self, u, v, cost):
-        """Add a **directed** edge u→v with the given *cost*."""
+        """Add an undirected edge {u, v} with the given cost."""
         self.add_node(u)
         self.add_node(v)
         self._adj[u][v] = cost
+        self._adj[v][u] = cost
 
     def remove_edge(self, u, v):
-        """Remove edges in **both** directions (u→v and v→u)."""
+        """Remove the undirected edge {u, v}."""
         if u in self._adj:
             self._adj[u].pop(v, None)
         if v in self._adj:
             self._adj[v].pop(u, None)
 
     def set_edge_cost(self, u, v, cost):
-        """Update the cost of the directed edge u→v."""
-        if u in self._adj and v in self._adj[u]:
+        """Update cost of existing undirected edge. Returns True if edge existed."""
+        exists = (u in self._adj and v in self._adj.get(u, {}))
+        if exists:
             self._adj[u][v] = cost
-            return True
-        return False
+            self._adj[v][u] = cost
+        return exists
 
     def has_edge(self, u, v):
         return u in self._adj and v in self._adj.get(u, {})
@@ -67,34 +70,36 @@ class Graph:
         return self._adj.get(u, {}).get(v, None)
 
     def get_neighbours(self, node_id):
-        """Return a *copy* of the outgoing-neighbour dict {target: cost}."""
+        """Return a copy of the neighbour dict {neighbour_id: cost}."""
         return dict(self._adj.get(node_id, {}))
 
     # ── graph algorithms ─────────────────────────────────────────
 
     def detect_cycle(self):
-        """Return True if the graph contains at least one directed cycle."""
-        WHITE, GRAY, BLACK = 0, 1, 2
-        color = {n: WHITE for n in self._adj}
-        for node in self._adj:
-            if color[node] == WHITE:
-                if self._dfs_has_cycle(node, color, WHITE, GRAY, BLACK):
+        """Return True if the undirected graph contains at least one cycle.
+
+        Uses DFS with parent tracking. An edge to an already-visited node
+        that is not the parent indicates a cycle.
+        """
+        visited = set()
+        for start in self._adj:
+            if start not in visited:
+                if self._dfs_cycle(start, None, visited):
                     return True
         return False
 
-    def _dfs_has_cycle(self, node, color, WHITE, GRAY, BLACK):
-        color[node] = GRAY
+    def _dfs_cycle(self, node, parent, visited):
+        visited.add(node)
         for neighbour in self._adj.get(node, {}):
-            if color[neighbour] == GRAY:
-                return True
-            if color[neighbour] == WHITE:
-                if self._dfs_has_cycle(neighbour, color, WHITE, GRAY, BLACK):
+            if neighbour not in visited:
+                if self._dfs_cycle(neighbour, node, visited):
                     return True
-        color[node] = BLACK
+            elif neighbour != parent:
+                return True
         return False
 
     def get_component(self, node_id):
-        """Return the set of nodes reachable from *node_id* via outgoing edges."""
+        """Return the set of all nodes reachable from node_id."""
         if node_id not in self._adj:
             return set()
         visited = set()
@@ -109,6 +114,13 @@ class Graph:
                     stack.append(neighbour)
         return visited
 
+    # ── bulk operations ─────────────────────────────────────────
+
+    def clear(self):
+        """Remove all nodes and edges."""
+        self._adj.clear()
+        self._ports.clear()
+
     # ── copy ─────────────────────────────────────────────────────
 
     def copy(self):
@@ -116,3 +128,11 @@ class Graph:
         g._adj = {k: dict(v) for k, v in self._adj.items()}
         g._ports = dict(self._ports)
         return g
+
+    def __repr__(self):
+        edges = set()
+        for u, nbrs in self._adj.items():
+            for v, c in nbrs.items():
+                key = (min(u, v), max(u, v))
+                edges.add((*key, c))
+        return f"Graph(nodes={sorted(self._adj)}, edges={sorted(edges)})"
