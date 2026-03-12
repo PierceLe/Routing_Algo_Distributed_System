@@ -67,8 +67,6 @@ class Protocol:
         failed_nodes,
         merged_nodes=None,
         merged_into=None,
-        split=False,
-        split_v1=None,
     ):
         """Encode full known topology as JSON bytes for socket."""
         if merged_nodes is None:
@@ -90,8 +88,6 @@ class Protocol:
             "failed": list(failed_nodes),
             "merged": list(merged_nodes),
             "merged_into": merged_into,
-            "split": bool(split),
-            "split_v1": list(split_v1) if split_v1 is not None else None,
         }
         return json.dumps(payload).encode("utf-8")
 

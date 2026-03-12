@@ -1,7 +1,6 @@
-"""Optional bonus commands: MERGE, SPLIT, CYCLE DETECT.
+"""Optional bonus commands: MERGE, CYCLE DETECT.
 
 MERGE <A> <B>: absorb node B into node A (edges with lower cost win).
-SPLIT: partition graph into two halves alphabetically, remove cross-edges.
 CYCLE DETECT: report whether the graph contains a cycle.
 """
 
@@ -85,40 +84,6 @@ class MergeCommand(Command):
         node.immediate_broadcast()
         node.broadcast_merged_into({self.node_id2: self.node_id1})
 
-
-class SplitCommand(Command):
-    """Partition the graph into two halves alphabetically."""
-
-    def execute(self, node):
-        with node.lock:
-            # Compute the global partition V1, V2 based on the current
-            # view of the component at this node, following the spec:
-            # 1) sort V, 2) k = floor(|V|/2), 3) V1 = first k nodes.
-            all_nodes = sorted(node.graph.get_nodes())
-            k = len(all_nodes) // 2
-            v1 = set(all_nodes[:k])
-
-            # Apply the partition locally.
-            changed = node._apply_split_partition_with_v1(v1)
-
-            if changed:
-                node.has_changes = True
-
-            if not node.suppress_routing_output:
-                filtered = node.get_filtered_graph()
-                routes = Dijkstra.compute(filtered, node.node_id)
-                node.last_routing_table = routes
-            else:
-                routes = None
-
-        # Broadcast the partition info to neighbours so they can apply
-        # the same V1/V2 rule to their local graphs.
-        node.broadcast_split_partition(v1)
-
-        node.safe_print("Graph partitioned successfully.")
-        if routes is not None:
-            node._output_routing_table(routes)
-        node.immediate_broadcast()
 
 class CycleDetectCommand(Command):
     """Check whether the current graph contains a cycle."""

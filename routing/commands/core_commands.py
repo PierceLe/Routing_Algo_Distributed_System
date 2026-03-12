@@ -118,7 +118,6 @@ class ResetCommand(Command):
                 nid for nid, _, _ in node.original_neighbours
             }
             node.failed_nodes.clear()
-            node.split_my_partition = None
             node.merged_away_nodes.clear()
             node.merged_preferred_edges.clear()
             node.is_up = True
