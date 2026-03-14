@@ -9,7 +9,7 @@ from .config import ConfigParser
 def main():
     args = sys.argv[1:]
 
-    if len(args) < 5:
+    if len(args) < 3:
         error_exit(
             "Error: Insufficient arguments provided. "
             "Usage: ./Routing.sh <Node-ID> <Port-NO> <Node-Config-File>"
@@ -26,15 +26,19 @@ def main():
 
     config_file = args[2]
 
-    try:
-        routing_delay = float(args[3])
-    except ValueError:
-        error_exit("Error: Invalid RoutingDelay. Must be a number.")
-
-    try:
-        update_interval = float(args[4])
-    except ValueError:
-        error_exit("Error: Invalid UpdateInterval. Must be a number.")
+    # Optional: RoutingDelay and UpdateInterval (defaults if not provided)
+    if len(args) >= 5:
+        try:
+            routing_delay = float(args[3])
+        except ValueError:
+            error_exit("Error: Invalid RoutingDelay. Must be a number.")
+        try:
+            update_interval = float(args[4])
+        except ValueError:
+            error_exit("Error: Invalid UpdateInterval. Must be a number.")
+    else:
+        routing_delay = 60.0
+        update_interval = 10.0
 
     original_neighbours = ConfigParser.parse(config_file)
 

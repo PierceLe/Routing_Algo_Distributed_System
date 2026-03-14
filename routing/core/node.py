@@ -65,6 +65,9 @@ class Node:
         # advertisement from the network to overwrite the cheaper cost.
         # Stored as undirected pairs (min(u,v), max(u,v)).
         self.merged_preferred_edges = set()
+        # After SPLIT: (v1, v2) partition sets. Reject any socket update
+        # that would re-add a cross-partition edge.
+        self.split_partitions = None  # (v1, v2) or None
 
         # ── synchronisation ──────────────────────────────────────
         self.lock = threading.RLock()
@@ -154,7 +157,7 @@ class Node:
 
     _KNOWN_COMMANDS = frozenset({
         "CHANGE", "FAIL", "RECOVER", "QUERY", "RESET",
-        "MERGE", "BATCH", "CYCLE",
+        "MERGE", "SPLIT", "BATCH", "CYCLE",
     })
 
     @staticmethod
@@ -361,6 +364,12 @@ class Node:
                 for n, ninfo in info.get("neighbours", {}).items():
                     if not self._accept_node(n):
                         continue
+                    # Reject cross-partition edges after SPLIT (prevents
+                    # old topology from other nodes re-adding removed edges)
+                    if self.split_partitions is not None:
+                        v1, v2 = self.split_partitions
+                        if (nid in v1 and n in v2) or (nid in v2 and n in v1):
+                            continue
                     ncost = ninfo["cost"]
                     nport = ninfo.get("port")
                     self.graph.add_node(n, nport)

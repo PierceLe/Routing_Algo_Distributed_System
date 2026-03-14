@@ -1,12 +1,70 @@
-"""Optional bonus commands: MERGE, CYCLE DETECT.
+"""Optional bonus commands: MERGE, SPLIT, CYCLE DETECT.
 
 MERGE <A> <B>: absorb node B into node A (edges with lower cost win).
+SPLIT: partition graph alphabetically, remove cross-partition edges.
 CYCLE DETECT: report whether the graph contains a cycle.
 """
 
 from .base import Command
 from ..core.dijkstra import Dijkstra
 from ..network.protocol import Protocol
+
+
+class SplitCommand(Command):
+    """Partition the graph: sort nodes alphabetically, split at k=floor(|V|/2),
+    remove all edges between V1 and V2.
+
+    Critical: graph is updated FIRST, then routing table is recomputed
+    from the new graph only (no reuse of old routes/state).
+    """
+
+    def execute(self, node):
+        with node.lock:
+            # 1) Compute partition: V1 = first k nodes, V2 = rest
+            nodes = sorted(node.graph.get_nodes())
+            if not nodes:
+                node.safe_print("Graph partitioned successfully.")
+                return
+
+            k = len(nodes) // 2
+            v1 = set(nodes[:k])
+            v2 = set(nodes[k:])
+
+            # 2) UPDATE GRAPH FIRST: remove all edges between V1 and V2
+            edges_to_remove = set()
+            for u in v1:
+                for v in node.graph.get_neighbours(u).keys():
+                    if v in v2:
+                        edges_to_remove.add((min(u, v), max(u, v)))
+
+            for u, v in edges_to_remove:
+                node.graph.remove_edge(u, v)
+
+            # 3) Update immediate_neighbours: only keep neighbours in same partition
+            my_partition = v1 if node.node_id in v1 else v2
+            node.immediate_neighbours &= my_partition
+
+            # 4) Clean merged_preferred_edges: remove entries for deleted edges
+            for u, v in edges_to_remove:
+                node.merged_preferred_edges.discard((u, v))
+
+            # 4b) Persist partition so socket updates never re-add cross-partition edges
+            node.split_partitions = (v1, v2)
+
+            # 5) Invalidate cached routing table (force fresh computation)
+            node.last_routing_table = None
+            node.has_changes = True
+
+            # 6) Recompute routing table ONLY from the new graph (no old state)
+            filtered = node.get_filtered_graph()
+            routes = Dijkstra.compute(filtered, node.node_id)
+            node.last_routing_table = routes
+
+        node.safe_print("Graph partitioned successfully.")
+        if not node.suppress_routing_output:
+            node._output_routing_table(routes)
+
+        node.immediate_broadcast()
 
 
 class MergeCommand(Command):

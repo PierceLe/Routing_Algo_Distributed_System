@@ -42,6 +42,7 @@ class CommandFactory:
             "QUERY": CommandFactory._parse_query,
             "RESET": CommandFactory._parse_reset,
             "MERGE": CommandFactory._parse_merge,
+            "SPLIT": CommandFactory._parse_split,
         }
         if cmd in dispatch:
             return dispatch[cmd](tokens)
@@ -186,3 +187,13 @@ class CommandFactory:
             )
         from .bonus_commands import CycleDetectCommand
         return CycleDetectCommand()
+
+    @staticmethod
+    def _parse_split(tokens):
+        if len(tokens) != 1:
+            error_exit(
+                "Error: Invalid command format. "
+                "Expected exactly: SPLIT."
+            )
+        from .bonus_commands import SplitCommand
+        return SplitCommand()

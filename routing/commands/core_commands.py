@@ -120,6 +120,7 @@ class ResetCommand(Command):
             node.failed_nodes.clear()
             node.merged_away_nodes.clear()
             node.merged_preferred_edges.clear()
+            node.split_partitions = None
             node.is_up = True
             node.has_changes = True
 
